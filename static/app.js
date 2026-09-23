@@ -15,7 +15,12 @@ const state = {
   connecting: null,           // {nodeId, optionId}
   dragNode: null,
   suppressClick: false,
+  history: { stack: [], index: -1, mergeKey: null, mergeAt: 0 },
+  savedSnapshot: null,        // JSON of {name, content} at last save / open
 };
+
+const HISTORY_LIMIT = 100;
+const MERGE_WINDOW_MS = 700;  // consecutive typing in the same field merges into one entry
 
 const $ = (sel) => document.querySelector(sel);
 const uid = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -319,7 +324,8 @@ function renderInspector() {
       const oid = row.dataset.oid;
       const o = n.options.find((x) => x.id === oid);
       row.querySelector(".opt-label-in").oninput = (e) => {
-        o.label = e.target.value; markDirty();
+        o.label = e.target.value;
+        commitTyped(`opt:${n.id}:${oid}`);
         const card = document.querySelector(`#node-${n.id} .opt-row #port-${n.id}-${oid}`);
         const lbl = card?.parentElement.querySelector(".opt-label");
         if (lbl) lbl.textContent = o.label || "(未命名选项)";
@@ -333,12 +339,14 @@ function renderInspector() {
   renderOptEdits();
 
   $("#fTitle").oninput = (e) => {
-    n.title = e.target.value; markDirty();
+    n.title = e.target.value;
+    commitTyped(`title:${n.id}`);
     const t = document.querySelector(`#node-${n.id} .ttl`);
     if (t) t.textContent = n.title || "(未命名问题)";
   };
   $("#fText").oninput = (e) => {
-    n.text = e.target.value; markDirty();
+    n.text = e.target.value;
+    commitTyped(`text:${n.id}`);
     const b = document.querySelector(`#node-${n.id} .body-txt`);
     if (b) b.textContent = n.text || "（无问题描述）";
   };
@@ -365,21 +373,99 @@ function renderInspector() {
   };
 }
 
-// ---------------------------------------------------------------- mutations
+// ---------------------------------------------------------------- history (undo / redo)
 
-function markDirty() {
-  if (!state.dirty) { state.dirty = true; renderStatus(); }
+const clone = (v) => JSON.parse(JSON.stringify(v));
+const docSnapshot = () => JSON.stringify({ name: state.doc?.name ?? "", content: state.doc?.content ?? null });
+
+function renderHistoryButtons() {
+  const undo = $("#btnUndo"), redo = $("#btnRedo");
+  if (undo) undo.disabled = state.history.index <= 0;
+  if (redo) redo.disabled = state.history.index >= state.history.stack.length - 1;
 }
+
+function resetHistory() {
+  state.history = { stack: [], index: -1, mergeKey: null, mergeAt: 0 };
+  state.savedSnapshot = state.doc ? docSnapshot() : null;
+  if (state.doc) pushHistory();
+  syncDirty();
+  renderHistoryButtons();
+}
+
+function pushHistory(mergeKey = null) {
+  const h = state.history;
+  const snap = clone(state.doc.content);
+  const now = Date.now();
+  if (mergeKey && h.mergeKey === mergeKey &&
+      h.index >= 0 && h.index === h.stack.length - 1 &&
+      now - h.mergeAt <= MERGE_WINDOW_MS) {
+    // same field typed into continuously: collapse into the current entry
+    h.stack[h.index] = snap;
+    h.mergeAt = now;
+  } else {
+    // drop any redo branch before recording a new change
+    h.stack = h.stack.slice(0, h.index + 1);
+    h.stack.push(snap);
+    if (h.stack.length > HISTORY_LIMIT) h.stack.shift();
+    h.index = h.stack.length - 1;
+    // a discrete change must never merge with a later typing burst
+    h.mergeKey = mergeKey;
+    h.mergeAt = mergeKey ? now : 0;
+  }
+  syncDirty();
+  renderHistoryButtons();
+}
+
+function syncDirty() {
+  state.dirty = !!state.doc && docSnapshot() !== state.savedSnapshot;
+  renderStatus();
+}
+
+function applyHistory(step) {
+  const h = state.history;
+  const next = h.index + step;
+  if (next < 0 || next >= h.stack.length) return;
+  h.index = next;
+  // typing after undo/redo must start a fresh, non-merged entry
+  h.mergeKey = null; h.mergeAt = 0;
+  state.doc.content = clone(h.stack[next]);
+  const ids = new Set((state.doc.content.nodes || []).map((n) => n.id));
+  if (!ids.has(state.selectedNodeId)) state.selectedNodeId = null;
+  if (state.selectedEdge) {
+    const n = getNode(state.selectedEdge.nodeId);
+    if (!n || !(n.options || []).some((o) => o.id === state.selectedEdge.optionId)) {
+      state.selectedEdge = null;
+    }
+  }
+  state.connecting = null;
+  state.dragNode = null;
+  syncDirty();
+  validateLocal();
+  renderAll();
+  renderHistoryButtons();
+}
+
+const undo = () => applyHistory(-1);
+const redo = () => applyHistory(1);
+
+// ---------------------------------------------------------------- mutations
 
 let validateTimer;
 function changed() {
-  markDirty();
+  pushHistory();
   drawNodes();
   drawEdges();
   renderInspector();
   clearTimeout(validateTimer);
   validateTimer = setTimeout(validateLocal, 150);
   renderSidebar();
+}
+
+// Continuous typing (title / text / option label): merged into one history entry.
+function commitTyped(mergeKey) {
+  pushHistory(mergeKey);
+  clearTimeout(validateTimer);
+  validateTimer = setTimeout(validateLocal, 150);
 }
 
 // ---------------------------------------------------------------- persistence
@@ -389,7 +475,13 @@ async function loadList(selectId) {
   renderSidebar();
   if (selectId) await openScript(selectId);
   else if (state.scripts.length) await openScript(state.scripts[0].id);
-  else state.doc = null;
+  else {
+    state.doc = null;
+    state.dirty = false;
+    state.markers = { cycles: [], orphans: [], uncovered: [], errors: [] };
+    resetHistory();
+    renderStatus();
+  }
 }
 
 async function openScript(id) {
@@ -403,6 +495,7 @@ async function openScript(id) {
   state.pan = { x: 60, y: 40 };
   validateLocal();
   renderAll();
+  resetHistory();
 }
 
 async function newScript(sample = false) {
@@ -440,9 +533,11 @@ async function saveScript() {
   });
   const fresh = await api(`/api/scripts/${state.currentId}/validate`).catch(() => null);
   if (fresh) { state.markers = fresh; }
-  state.dirty = false;
   state.scripts = await api("/api/scripts");
+  validateLocal();
   renderAll();
+  // saved: unsaved marker clears and undo/redo history restarts from this point
+  resetHistory();
   toast("已保存");
 }
 
@@ -458,7 +553,13 @@ function bindToolbar() {
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
   $("#btnAddNode").onclick = addNode;
-  $("#scriptName").oninput = markDirty;
+  $("#btnUndo").onclick = undo;
+  $("#btnRedo").onclick = redo;
+  $("#scriptName").oninput = () => {
+    if (!state.doc) return;
+    state.doc.name = $("#scriptName").value;
+    syncDirty();
+  };
   $("#scriptName").onchange = () => { if (state.currentId) saveScript(); };
 
   $("#scriptList").addEventListener("click", async (e) => {
@@ -480,7 +581,17 @@ function bindToolbar() {
   });
 
   window.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveScript(); }
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (document.querySelector(".modal-mask.open")) return;
+    const key = e.key.toLowerCase();
+    if (key === "s") { e.preventDefault(); saveScript(); }
+    else if (key === "z") {
+      e.preventDefault();
+      if (e.shiftKey) redo(); else undo();
+    } else if (key === "y") {
+      e.preventDefault();
+      redo();
+    }
   });
 }
 
@@ -647,7 +758,7 @@ function bindCanvas() {
       n.y = state.dragNode.y + e.clientY - state.dragNode.startY;
       const el = document.getElementById(`node-${n.id}`);
       el.style.left = `${n.x}px`; el.style.top = `${n.y}px`;
-      drawEdges(); markDirty();
+      drawEdges(); syncDirty();
       state.dragNode.moved = true;
     }
     if (state.connecting) {
@@ -663,7 +774,18 @@ function bindCanvas() {
   document.addEventListener("mouseup", (e) => {
     panning = null;
     if (state.dragNode) {
-      if (state.dragNode.moved) state.suppressClick = true;
+      const wasMoved = state.dragNode.moved;
+      if (wasMoved) state.suppressClick = true;
+      // a whole drag counts as a single undo step; skip it if position is unchanged
+      const n = getNode(state.dragNode.id);
+      if (wasMoved && n && (n.x !== state.dragNode.x || n.y !== state.dragNode.y)) {
+        pushHistory();
+        clearTimeout(validateTimer);
+        validateTimer = setTimeout(validateLocal, 150);
+      } else {
+        // click without movement (or dragged back to origin): reconcile dirty badge
+        syncDirty();
+      }
       state.dragNode = null;
     }
     if (state.connecting) {
