@@ -17,6 +17,100 @@ const state = {
   suppressClick: false,
 };
 
+// ---------------------------------------------------------------- undo / redo
+//
+// Snapshot-based history: every discrete edit commits a deep clone of the whole
+// document (name + content). Consecutive commits with the same coalesce key are
+// merged (a single typing burst in one field) and each node drag is committed
+// once on mouseup. After undo/redo the canvas, inspector, validation markers
+// and the unsaved flag are all re-derived from the restored snapshot.
+
+const HISTORY_LIMIT = 100;
+const TYPING_MERGE_MS = 800;
+
+const history = {
+  stack: [],                  // [{doc, label, time, key}]
+  index: -1,                  // index of the currently applied snapshot
+  baseline: null,             // saved snapshot (name + content); dirty = doc != baseline
+};
+
+const cloneDoc = (d) => JSON.parse(JSON.stringify(d));
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== "object") return a === b;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
+  const ka = Object.keys(a), kb = Object.keys(b);
+  return ka.length === kb.length && ka.every((k) => deepEqual(a[k], b[k]));
+}
+
+function resetHistory() {
+  history.stack = [];
+  history.index = -1;
+  history.baseline = state.doc ? cloneDoc(state.doc) : null;
+  if (state.doc) {
+    history.stack = [{ doc: cloneDoc(state.doc), label: "已保存版本", time: Date.now(), key: null }];
+    history.index = 0;
+  }
+  updateHistoryButtons();
+}
+
+function commitHistory(label, key = null) {
+  if (!state.doc) return;
+  const now = Date.now();
+  const last = history.stack[history.index];
+  if (key && last && last.key === key && now - last.time < TYPING_MERGE_MS) {
+    // Merge into the ongoing typing burst (same field, no pause, no undo/redo).
+    last.doc = cloneDoc(state.doc);
+    last.time = now;
+  } else {
+    history.stack = history.stack.slice(0, history.index + 1);
+    history.stack.push({ doc: cloneDoc(state.doc), label, time: now, key });
+    if (history.stack.length > HISTORY_LIMIT) {
+      history.stack.shift();
+      history.index--;
+    }
+    history.index = history.stack.length - 1;
+  }
+  syncDirty();
+  updateHistoryButtons();
+}
+
+function restoreFromSnapshot(entry) {
+  state.doc = cloneDoc(entry.doc);
+  if (!getNode(state.selectedNodeId)) state.selectedNodeId = null;
+  const src = getNode(state.selectedEdge?.nodeId);
+  if (!src?.options.some((o) => o.id === state.selectedEdge?.optionId)) state.selectedEdge = null;
+  $("#scriptName").value = state.doc.name || "";
+  validateLocal();
+  renderAll();
+  syncDirty();
+  updateHistoryButtons();
+}
+
+function undo() {
+  if (!state.doc || history.index <= 0) return;
+  history.index--;
+  restoreFromSnapshot(history.stack[history.index]);
+}
+
+function redo() {
+  if (!state.doc || history.index >= history.stack.length - 1) return;
+  history.index++;
+  restoreFromSnapshot(history.stack[history.index]);
+}
+
+function updateHistoryButtons() {
+  const canUndo = state.doc && history.index > 0;
+  const canRedo = state.doc && history.index < history.stack.length - 1;
+  const u = $("#btnUndo"), r = $("#btnRedo");
+  if (u) { u.disabled = !canUndo; u.title = canUndo ? `撤销：${history.stack[history.index].label} (Ctrl/Cmd+Z)` : "撤销 (Ctrl/Cmd+Z)"; }
+  if (r) { r.disabled = !canRedo; r.title = canRedo ? `重做：${history.stack[history.index + 1].label} (Shift+Ctrl/Cmd+Z)` : "重做 (Shift+Ctrl/Cmd+Z)"; }
+}
+
 const $ = (sel) => document.querySelector(sel);
 const uid = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 const getNode = (id) => state.doc?.content.nodes.find((n) => n.id === id);
@@ -58,6 +152,12 @@ function tarjanCycles(ids, adj) {
 }
 
 function validateLocal() {
+  if (!state.doc) {
+    state.markers = { cycles: [], orphans: [], uncovered: [], errors: [] };
+    renderStatus();
+    drawEdges();
+    return;
+  }
   const content = state.doc.content;
   const nodes = content.nodes;
   const ids = nodes.map((n) => n.id);
@@ -132,6 +232,7 @@ function renderCanvas() {
 }
 
 function renderNodeFlags() {
+  if (!state.doc) return;
   state.doc.content.nodes.forEach((n) => {
     const el = document.getElementById(`node-${n.id}`);
     if (!el) return;
@@ -153,6 +254,7 @@ function renderNodeFlags() {
 function drawNodes() {
   const world = $("#world");
   [...world.querySelectorAll(".node")].forEach((e) => e.remove());
+  if (!state.doc) return;
   const nodes = state.doc.content.nodes;
   nodes.forEach((n) => {
     if (n.x === undefined || n.x === null) { n.x = 0; n.y = 0; }
@@ -193,6 +295,7 @@ function portPoint(nodeId, optId) {
 function drawEdges() {
   const svg = $("#edges");
   svg.querySelectorAll("path.edge:not(#tempEdge), polygon.arrow").forEach((e) => e.remove());
+  if (!state.doc) return;
   const NS = "http://www.w3.org/2000/svg";
   state.doc.content.nodes.forEach((n) => {
     (n.options || []).forEach((o) => {
@@ -239,6 +342,7 @@ function drawEdges() {
 
 function renderInspector() {
   const el = $("#inspector");
+  if (!state.doc) { el.innerHTML = ""; return; }
   const n = getNode(state.selectedNodeId);
 
   if (state.selectedEdge) {
@@ -257,8 +361,14 @@ function renderInspector() {
         </select>
       </div>
       <button class="danger" id="edgeDel">删除连线</button>`;
-    $("#edgeTarget").onchange = (e) => { opt.target_id = e.target.value || null; changed(); };
-    $("#edgeDel").onclick = () => { opt.target_id = null; state.selectedEdge = null; changed(); };
+    $("#edgeTarget").onchange = (e) => {
+      opt.target_id = e.target.value || null;
+      commitHistory("修改连线目标"); changed();
+    };
+    $("#edgeDel").onclick = () => {
+      opt.target_id = null; state.selectedEdge = null;
+      commitHistory("删除连线"); changed();
+    };
     return;
   }
 
@@ -273,7 +383,10 @@ function renderInspector() {
         </select>
       </div>
       <div class="empty">在画布空白处拖动可平移；拖拽节点标题移动节点；拖拽选项右侧圆点连接到目标节点；点击连线可修改/删除。</div>`;
-    $("#startNode").onchange = (e) => { state.doc.content.start_node_id = e.target.value || null; changed(); };
+    $("#startNode").onchange = (e) => {
+      state.doc.content.start_node_id = e.target.value || null;
+      commitHistory("设置起始节点"); changed();
+    };
     return;
   }
 
@@ -319,39 +432,52 @@ function renderInspector() {
       const oid = row.dataset.oid;
       const o = n.options.find((x) => x.id === oid);
       row.querySelector(".opt-label-in").oninput = (e) => {
-        o.label = e.target.value; markDirty();
+        o.label = e.target.value;
+        commitHistory("修改选项文案", `opt-label:${n.id}:${oid}`);
         const card = document.querySelector(`#node-${n.id} .opt-row #port-${n.id}-${oid}`);
         const lbl = card?.parentElement.querySelector(".opt-label");
         if (lbl) lbl.textContent = o.label || "(未命名选项)";
       };
-      row.querySelector(".opt-target").onchange = (e) => { o.target_id = e.target.value || null; changed(); };
+      row.querySelector(".opt-target").onchange = (e) => {
+        o.target_id = e.target.value || null;
+        commitHistory("修改选项跳转"); changed();
+      };
       row.querySelector(".opt-del").onclick = () => {
-        n.options = n.options.filter((x) => x.id !== oid); changed();
+        n.options = n.options.filter((x) => x.id !== oid);
+        commitHistory("删除选项"); changed();
       };
     });
   };
   renderOptEdits();
 
   $("#fTitle").oninput = (e) => {
-    n.title = e.target.value; markDirty();
+    n.title = e.target.value;
+    commitHistory("修改节点标题", `field:title:${n.id}`);
     const t = document.querySelector(`#node-${n.id} .ttl`);
     if (t) t.textContent = n.title || "(未命名问题)";
   };
   $("#fText").oninput = (e) => {
-    n.text = e.target.value; markDirty();
+    n.text = e.target.value;
+    commitHistory("修改节点文案", `field:text:${n.id}`);
     const b = document.querySelector(`#node-${n.id} .body-txt`);
     if (b) b.textContent = n.text || "（无问题描述）";
   };
   $("#fTitle").onchange = $("#fText").onchange = () => renderOptEdits();
   document.querySelectorAll("input[name=ntype]").forEach((r) => r.onchange = () => {
     n.type = document.querySelectorAll("input[name=ntype]")[0].checked ? "question" : "info";
-    changed();
+    commitHistory("修改节点类型"); changed();
   });
-  $("#fTerminal").onchange = (e) => { n.terminal = e.target.checked; changed(); };
-  $("#fSetStart").onclick = () => { state.doc.content.start_node_id = n.id; changed(); };
+  $("#fTerminal").onchange = (e) => {
+    n.terminal = e.target.checked;
+    commitHistory(e.target.checked ? "标记终止节点" : "取消终止节点"); changed();
+  };
+  $("#fSetStart").onclick = () => {
+    state.doc.content.start_node_id = n.id;
+    commitHistory("设置起始节点"); changed();
+  };
   $("#addOpt").onclick = () => {
     n.options.push({ id: uid("o"), label: `选项 ${n.options.length + 1}`, target_id: null });
-    changed();
+    commitHistory("添加选项"); changed();
   };
   $("#delNode").onclick = () => {
     if (!confirm("确认删除该节点？相关连线将一并清除。")) return;
@@ -361,25 +487,26 @@ function renderInspector() {
     }));
     if (state.doc.content.start_node_id === n.id) state.doc.content.start_node_id = null;
     state.selectedNodeId = null;
-    changed();
+    commitHistory("删除节点"); changed();
   };
 }
 
 // ---------------------------------------------------------------- mutations
 
-function markDirty() {
-  if (!state.dirty) { state.dirty = true; renderStatus(); }
+function syncDirty() {
+  const dirty = !!state.doc && !deepEqual(state.doc, history.baseline);
+  if (dirty !== state.dirty) { state.dirty = dirty; renderStatus(); }
 }
 
 let validateTimer;
 function changed() {
-  markDirty();
   drawNodes();
   drawEdges();
   renderInspector();
   clearTimeout(validateTimer);
   validateTimer = setTimeout(validateLocal, 150);
   renderSidebar();
+  syncDirty();
 }
 
 // ---------------------------------------------------------------- persistence
@@ -389,7 +516,17 @@ async function loadList(selectId) {
   renderSidebar();
   if (selectId) await openScript(selectId);
   else if (state.scripts.length) await openScript(state.scripts[0].id);
-  else state.doc = null;
+  else {
+    state.currentId = null;
+    state.doc = null;
+    state.selectedNodeId = null;
+    state.selectedEdge = null;
+    state.dirty = false;
+    $("#scriptName").value = "";
+    resetHistory();
+    validateLocal();
+    renderAll();
+  }
 }
 
 async function openScript(id) {
@@ -401,6 +538,7 @@ async function openScript(id) {
   state.dirty = false;
   $("#scriptName").value = s.name;
   state.pan = { x: 60, y: 40 };
+  resetHistory();
   validateLocal();
   renderAll();
 }
@@ -441,6 +579,7 @@ async function saveScript() {
   const fresh = await api(`/api/scripts/${state.currentId}/validate`).catch(() => null);
   if (fresh) { state.markers = fresh; }
   state.dirty = false;
+  resetHistory();
   state.scripts = await api("/api/scripts");
   renderAll();
   toast("已保存");
@@ -452,13 +591,20 @@ function bindToolbar() {
   $("#btnNew").onclick = () => newScript(false);
   $("#btnSample").onclick = () => newScript(true);
   $("#btnSave").onclick = saveScript;
+  $("#btnUndo").onclick = undo;
+  $("#btnRedo").onclick = redo;
   $("#btnPreview").onclick = openPreview;
   $("#btnShare").onclick = openShare;
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
   $("#btnAddNode").onclick = addNode;
-  $("#scriptName").oninput = markDirty;
+  $("#scriptName").oninput = () => {
+    if (!state.doc) return;
+    state.doc.name = $("#scriptName").value;
+    commitHistory("修改脚本名称", "script-name");
+    renderSidebar();
+  };
   $("#scriptName").onchange = () => { if (state.currentId) saveScript(); };
 
   $("#scriptList").addEventListener("click", async (e) => {
@@ -468,7 +614,13 @@ function bindToolbar() {
       const id = Number(del.dataset.del);
       if (!confirm("确认删除该脚本？")) return;
       await api(`/api/scripts/${id}`, { method: "DELETE" });
-      if (state.currentId === id) { state.currentId = null; state.doc = null; }
+      if (state.currentId === id) {
+        state.currentId = null;
+        state.doc = null;
+        state.dirty = false;
+        $("#scriptName").value = "";
+        resetHistory();
+      }
       await loadList();
       return;
     }
@@ -480,7 +632,16 @@ function bindToolbar() {
   });
 
   window.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveScript(); }
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && (e.key === "z" || e.key === "Z")) {
+      // Don't fight the browser while the user is composing CJK text.
+      if (e.isComposing) return;
+      e.preventDefault();
+      if (e.shiftKey) redo(); else undo();
+      return;
+    }
+    if (mod && (e.key === "y" || e.key === "Y")) { e.preventDefault(); redo(); return; }
+    if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); saveScript(); }
   });
 }
 
@@ -498,6 +659,7 @@ function addNode() {
   state.doc.content.nodes.push(node);
   if (!state.doc.content.start_node_id) state.doc.content.start_node_id = node.id;
   state.selectedNodeId = node.id;
+  commitHistory("添加节点");
   changed();
 }
 
@@ -647,7 +809,7 @@ function bindCanvas() {
       n.y = state.dragNode.y + e.clientY - state.dragNode.startY;
       const el = document.getElementById(`node-${n.id}`);
       el.style.left = `${n.x}px`; el.style.top = `${n.y}px`;
-      drawEdges(); markDirty();
+      drawEdges(); syncDirty();
       state.dragNode.moved = true;
     }
     if (state.connecting) {
@@ -663,7 +825,17 @@ function bindCanvas() {
   document.addEventListener("mouseup", (e) => {
     panning = null;
     if (state.dragNode) {
-      if (state.dragNode.moved) state.suppressClick = true;
+      if (state.dragNode.moved) {
+        state.suppressClick = true;
+        // A whole drag counts as one history item; drop it if the node ended
+        // up exactly where it started (no effective change).
+        const n = getNode(state.dragNode.id);
+        if (n && (n.x !== state.dragNode.x || n.y !== state.dragNode.y)) {
+          commitHistory("移动节点");
+          clearTimeout(validateTimer);
+          validateTimer = setTimeout(validateLocal, 150);
+        }
+      }
       state.dragNode = null;
     }
     if (state.connecting) {
@@ -674,10 +846,13 @@ function bindCanvas() {
       if (targetEl) {
         const n = getNode(state.connecting.nodeId);
         const o = n.options.find((x) => x.id === state.connecting.optionId);
-        o.target_id = targetEl.dataset.id;
+        const hadTarget = !!o.target_id;
+        if (targetEl.dataset.id !== o.target_id) {
+          o.target_id = targetEl.dataset.id;
+          commitHistory(hadTarget ? "修改连线目标" : "添加连线");
+        }
         changed();
-      }
-      state.connecting = null;
+      }      state.connecting = null;
       $("#connectingTip").style.display = "none";
     }
   });

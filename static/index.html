@@ -22,6 +22,8 @@
   <div class="main">
     <div class="toolbar">
       <input class="title-input" id="scriptName" value="" placeholder="脚本名称">
+      <button id="btnUndo" title="撤销 (Ctrl/Cmd+Z)" disabled>↶ 撤销</button>
+      <button id="btnRedo" title="重做 (Shift+Ctrl/Cmd+Z)" disabled>↷ 重做</button>
       <button id="btnAddNode">＋ 添加问题节点</button>
       <button class="primary" id="btnSave">保存 (Ctrl+S)</button>
       <div class="spacer"></div>
@@ -46,7 +48,8 @@
         拖动节点标题移动 · 拖拽选项右侧圆点连线 · 点击连线修改/删除<br>
         空白处拖动平移画布 · <b style="color:var(--cycle)">红=环路</b> /
         <b style="color:var(--orphan)">橙虚线=孤立</b> /
-        <b style="color:var(--uncovered)">紫=未覆盖出口</b>
+        <b style="color:var(--uncovered)">紫=未覆盖出口</b><br>
+        Ctrl/Cmd+Z 撤销 · Shift+Ctrl/Cmd+Z 重做
       </div>
     </div>
   </div>
